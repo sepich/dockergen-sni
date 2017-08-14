@@ -1,0 +1,52 @@
+version: "3.1"
+networks:
+  ingress:
+  # host:
+  #   external: true
+
+services:
+
+  haproxy:
+    image: sepa/dockergen-sni
+    build:
+      dockerfile: Dockerfile
+      context: .
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8081:8081"
+    labels:
+      proxy.syslog.ip: "1.2.3.4"
+    networks:
+      - ingress
+      # - host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # - .:/app
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  app1:
+    image: app
+    labels:
+      proxy.virtualhost: app1.local
+    build:
+      dockerfile: app.dockerfile
+      context: .
+    command: /bin/bash -c "sed 's/{{}}/app1/' -i /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    networks:
+      - ingress
+
+  app2:
+    image: app
+    labels:
+      proxy.virtualhost: app2.local
+    build:
+      dockerfile: app.dockerfile
+      context: .
+    command: /bin/bash -c "sed 's/{{}}/app2/' -i /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    networks:
+      - ingress
+

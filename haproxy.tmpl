@@ -1,0 +1,144 @@
+{{ $ProxyContainer := where $ "ID" .Docker.CurrentContainerID | first -}}
+global
+  {{- if index $ProxyContainer.Labels "proxy.syslog.ip" }}
+  log {{ index $ProxyContainer.Labels "proxy.syslog.ip" }} local0
+  {{- end }}
+  chroot /var/lib/haproxy
+  user haproxy
+  group haproxy
+  daemon
+  ssl-server-verify none
+
+defaults
+  log     global
+  option  dontlognull
+  timeout client 30s
+  timeout server 30s
+  timeout connect 5s
+  option redispatch
+  maxconn 5000
+  retries 3
+
+frontend stats
+  mode http
+  bind *:8081
+  stats enable
+  stats uri /
+
+# HTTP VIP
+frontend ft_http_vip
+  bind    *:80
+  mode    http
+  option  httplog
+  option  forwardfor
+{{ range $vhost, $containers := groupByLabel $ "proxy.virtualhost" }}
+  {{- $added := false }}
+  {{- $vhost := trim $vhost }}
+  {{- $sha := (sha1 $vhost) }}
+  {{- range $container := $containers }}
+    {{- range $proxyNetwork := $ProxyContainer.Networks }}
+      {{- range $containerNetwork := $container.Networks }}
+        {{- if and (eq $proxyNetwork.Name $containerNetwork.Name) (not $added) }}
+  # {{ $vhost }} via "{{ $containerNetwork.Name }}" network
+  acl acl_{{ $vhost }} hdr_dom(host) -i {{ $vhost }}
+  use_backend bk_http_{{ $vhost }} if acl_{{ $vhost }}
+          {{- $added := true }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{ end }}
+
+# SNI VIP
+frontend ft_sni_vip
+  bind *:443
+  mode tcp
+  tcp-request inspect-delay 5s
+  tcp-request content accept if { req_ssl_hello_type 1 }
+{{ range $vhost, $containers := groupByLabel $ "proxy.virtualhost" }}
+  {{- $added := false }}
+  {{- $vhost := trim $vhost }}
+  {{- $sha := (sha1 $vhost) }}
+  {{- range $container := $containers }}
+    {{- range $proxyNetwork := $ProxyContainer.Networks }}
+      {{- range $containerNetwork := $container.Networks }}
+        {{- if and (eq $proxyNetwork.Name $containerNetwork.Name) (not $added) }}
+  # {{ $vhost }} via "{{ $containerNetwork.Name }}" network
+  acl acls_{{ $sha }} req_ssl_sni -i {{ $vhost }}
+  use_backend bk_ssl_{{ $vhost }} if acls_{{ $sha }}
+          {{- $added := true }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{ end }}
+
+
+{{ range $vhost, $containers := groupByLabel $ "proxy.virtualhost" -}}
+{{- $vhost := trim $vhost }}
+backend bk_http_{{ $vhost }}
+  mode    http
+  # option httpchk /webping
+  # option http-server-close
+  {{- range $c, $container := $containers -}}
+    {{- $addrLen := len $container.Addresses -}}
+    {{- range $proxyNetwork := $ProxyContainer.Networks -}}
+      {{- range $n, $containerNetwork := $container.Networks -}}
+        {{- if eq $proxyNetwork.Name $containerNetwork.Name -}}
+          {{/* If only 1 port exposed, use that */}}
+          {{- if eq $addrLen 1 -}}
+            {{- $address := index $container.Addresses 0 }}
+            {{ if eq $address.Port "443" (index $container.Labels "proxy.https.port") }}
+  redirect scheme https
+            {{ else }}
+  server {{ $container.Name }}_{{ $c }}_{{ $n }} {{ $containerNetwork.IP }}:{{ $address.Port }} check inter 10s
+            {{ end }}
+          {{/* If more than one port exposed, use the one matching 'proxy.http.port' label, falling back to standard 80 */}}
+          {{- else -}}
+            {{- $port := "80" | or (index $container.Labels "proxy.http.port") -}}
+            {{- $address := where $container.Addresses "Port" $port | first }}
+  server {{ $container.Name }}_{{ $c }}_{{ $n }} {{ $containerNetwork.IP }}:{{ $address.Port }} check inter 10s
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end }}
+
+{{ end -}}
+
+{{ range $vhost, $containers := groupByLabel $ "proxy.virtualhost" -}}
+{{- $vhost := trim $vhost }}
+backend bk_ssl_{{ $vhost }}
+  mode tcp
+  balance roundrobin
+  stick-table type binary len 32 size 30k expire 30m
+  acl clienthello req_ssl_hello_type 1
+  acl serverhello rep_ssl_hello_type 2
+  tcp-request inspect-delay 5s
+  tcp-request content accept if clienthello
+  tcp-response content accept if serverhello
+  stick on payload_lv(43,1) if clienthello
+  stick store-response payload_lv(43,1) if serverhello
+  {{- range $c, $container := $containers -}}
+    {{- $addrLen := len $container.Addresses -}}
+    {{- range $proxyNetwork := $ProxyContainer.Networks -}}
+      {{- range $n, $containerNetwork := $container.Networks -}}
+        {{- if eq $proxyNetwork.Name $containerNetwork.Name -}}
+          {{/* If only 1 port exposed, use that */}}
+          {{- if eq $addrLen 1 -}}
+            {{- $address := index $container.Addresses 0 }}
+            {{ if eq $address.Port "443" (index $container.Labels "proxy.https.port") }}
+  server {{ $container.Name }}_{{ $c }}_{{ $n }} {{ $containerNetwork.IP }}:{{ $address.Port }} check check-ssl inter 10s
+            {{ end }}
+          {{/* If more than one port exposed, use the one matching 'proxy.https.port' label, falling back to standard 443 */}}
+          {{- else -}}
+            {{- $port := "443" | or (index $container.Labels "proxy.https.port") -}}
+            {{- $address := where $container.Addresses "Port" $port | first }}
+  server {{ $container.Name  }}_{{ $c }}_{{ $n }} {{ $containerNetwork.IP }}:{{ $address.Port }} check check-ssl inter 10s
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end }}
+
+{{ end -}}
